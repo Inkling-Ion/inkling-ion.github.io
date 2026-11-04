@@ -268,7 +268,7 @@ svg.chart text{fill:var(--muted);font:700 11px var(--sans)}
 <body>
 <div id="app"><noscript>Inkling Budget needs JavaScript turned on in your browser.</noscript></div>
 <script>
-const BUILD={"mode": "app", "version": "1.0.0", "sw": true, "storeKey": "inkion.budget.v1"};
+const BUILD={"mode": "app", "version": "1.1.0", "sw": true, "storeKey": "inkion.budget.v1"};
 /* Inkling Budget - core: utilities, state, calculations, sample data.
    No network calls. Everything is stored in this browser (localStorage). */
 'use strict';
@@ -339,9 +339,12 @@ function blankState() {
     },
     cats: STARTER_CATS.map(([name, group, budget, icon]) => ({ id: uid(), name, group, budget, icon, owner: 'shared' })),
     tx: [], bills: [], pays: [], debts: [], debtPlan: { strategy: 'avalanche', extra: 0 }, goals: [],
-    nw: { accts: [], hist: {}, incDebts: true }
+    nw: { accts: [], hist: {}, incDebts: true }, gifts: blankGifts()
   };
 }
+/* Next Dec 25 (today counts). */
+function nextHoliday() { const t = todayISO(), y = Number(t.slice(0, 4)), d = iso(y, 12, 25); return d >= t ? d : iso(y + 1, 12, 25); }
+function blankGifts() { return { title: 'Holiday gifts', date: nextHoliday(), cat: null, people: [] }; }
 
 function migrate(s) {
   const b = blankState();
@@ -354,6 +357,11 @@ function migrate(s) {
   if (!s.nw.hist || typeof s.nw.hist !== 'object') s.nw.hist = {};
   for (const bl of s.bills) if (!bl.paid || typeof bl.paid !== 'object') bl.paid = {};
   for (const p of s.pays) if (!p.logged || typeof p.logged !== 'object') p.logged = {};
+  const g0 = s.gifts && typeof s.gifts === 'object' ? s.gifts : {};
+  s.gifts = Object.assign(blankGifts(), g0);
+  if (g0.date === undefined || g0.date === null) s.gifts.date = nextHoliday();
+  if (!Array.isArray(s.gifts.people)) s.gifts.people = [];
+  for (const p of s.gifts.people) if (!Array.isArray(p.gifts)) p.gifts = [];
   s.app = 'inkling-budget'; s.v = 1;
   return s;
 }
@@ -443,6 +451,7 @@ function deleteTx(id) {
   if (!t) return;
   for (const b of S.bills) for (const k in b.paid) if (b.paid[k] === id) delete b.paid[k];
   for (const p of S.pays) for (const k in p.logged) if (p.logged[k] === id) delete p.logged[k];
+  for (const p of S.gifts.people) for (const g of p.gifts) if (g.tx === id) g.tx = null;
 }
 /* Autopay: tick autopay bills whose due date has arrived (this month and last month only, never before the bill was added). */
 function runAutopay() {
@@ -563,6 +572,46 @@ function netWorth() {
 }
 function snapNetWorth() { if (S.nw.accts.length || (S.nw.incDebts && S.debts.length)) S.nw.hist[monthOf(todayISO())] = netWorth().total; }
 
+/* ---------------------------------------------------------------- gift list
+   A gift's "bought" state is its linked spending entry (g.tx), so editing or deleting that entry on the Spending screen
+   keeps the gift list right. */
+const giftTx = g => g && g.tx ? S.tx.find(t => t.id === g.tx) || null : null;
+function giftCat() {
+  if (S.gifts.cat && cat(S.gifts.cat)) return S.gifts.cat;
+  let c = S.cats.find(x => /gift/i.test(x.name) && x.group !== 'Income');
+  if (!c) { c = { id: uid(), name: 'Gifts', group: 'Wants', budget: 0, icon: '🎁', owner: 'shared' }; S.cats.push(c); }
+  S.gifts.cat = c.id;
+  return c.id;
+}
+function personInfo(p) {
+  let spent = 0, est = 0, bought = 0;
+  for (const g of p.gifts) { const t = giftTx(g); if (t) { spent += t.amt; bought++; } else est += num(g.price); }
+  const budget = num(p.budget);
+  return { budget, spent: round2(spent), est: round2(est), left: round2(budget - spent), proj: round2(spent + est), bought, count: p.gifts.length, toBuy: p.gifts.length - bought };
+}
+function giftTotals() {
+  const ps = S.gifts.people.map(personInfo);
+  const r = { budget: round2(sum(ps, x => x.budget)), spent: round2(sum(ps, x => x.spent)), est: round2(sum(ps, x => x.est)), bought: sum(ps, x => x.bought), count: sum(ps, x => x.count) };
+  r.left = round2(r.budget - r.spent); r.proj = round2(r.spent + r.est); r.toBuy = r.count - r.bought;
+  r.days = S.gifts.date ? diffDays(todayISO(), S.gifts.date) : null;
+  r.noIdeas = S.gifts.people.filter(p => !p.gifts.length).length;
+  return r;
+}
+function buyGift(p, g, amt, date, who) {
+  if (giftTx(g)) return null;
+  const t = { id: uid(), date: date || todayISO(), type: 'out', amt: round2(amt), cat: giftCat(), note: `${g.idea} for ${p.name}`.slice(0, 60), who: who || 'joint', gift: g.id };
+  S.tx.push(t); g.tx = t.id;
+  return t;
+}
+function unbuyGift(g) { if (g.tx) S.tx = S.tx.filter(t => t.id !== g.tx); g.tx = null; }
+/* After the holiday: keep people and budgets, clear the gifts (their spending entries stay), move the date on a year. */
+function newGiftSeason() {
+  for (const p of S.gifts.people) p.gifts = [];
+  let d = S.gifts.date;
+  while (d && d < todayISO()) { const [y, m, dd] = d.split('-').map(Number); d = iso(y + 1, m, Math.min(dd, daysIn(y + 1, m))); }
+  S.gifts.date = d;
+}
+
 /* ---------------------------------------------------------------- export helpers */
 function txCSV() {
   const q = v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
@@ -590,7 +639,7 @@ function sampleState() {
   add('net', 'Internet', 'Bills', 70, '📶'); add('phone', 'Phones', 'Bills', 95, '📱'); add('ins', 'Car insurance', 'Bills', 140, '🛡️'); add('stream', 'Streaming', 'Bills', 32, '📺');
   add('groc', 'Groceries', 'Needs', 650, '🛒'); add('gas', 'Gas', 'Needs', 180, '⛽'); add('home', 'Household', 'Needs', 80, '🧺'); add('med', 'Medical', 'Needs', 60, '🩺'); add('pet', 'Pet care', 'Needs', 70, '🐾');
   add('dine', 'Dining out', 'Wants', 220, '🍽️'); add('fun1', 'Fun money - Sam', 'Wants', 100, '🎮', 'p1'); add('fun2', 'Fun money - Jordan', 'Wants', 100, '🎨', 'p2');
-  add('shop', 'Shopping', 'Wants', 120, '🛍️'); add('gift', 'Gifts', 'Wants', 60, '🎁');
+  add('shop', 'Shopping', 'Wants', 120, '🛍️'); add('gift', 'Gifts', 'Wants', 150, '🎁');
   add('emerg', 'Emergency fund', 'Savings', 300, '🐷'); add('vac', 'Vacation', 'Savings', 200, '🌴'); add('carfix', 'Car repairs', 'Savings', 75, '🔧');
   add('cc', 'Credit card payment', 'Debt', 401, '💳'); add('carloan', 'Car loan', 'Debt', 289, '🚗'); add('student', 'Student loan', 'Debt', 210, '🎓', 'p2');
 
@@ -646,6 +695,23 @@ function sampleState() {
     { id: 'a3', name: 'Retirement (401k)', kind: 'asset', val: 21650 }, { id: 'a4', name: 'Car (estimated value)', kind: 'asset', val: 14500 }], hist: {} };
   const nwNow = netWorth().total;
   for (let k = 5; k >= 0; k--) s.nw.hist[addMonthsKey(M, -k)] = round2(nwNow - k * 610 - (k % 2) * 140);
+  // gift list: [name, budget, [idea, price, bought days ago or null, where]]
+  s.gifts = { title: 'Holiday gifts', date: nextHoliday(), cat: C.gift, people: [] };
+  const people = [['Mom', 120, [['Cozy robe', 68, 6, ''], ['Photo book', 35, null, 'Order by Dec 10']]],
+    ['Dad', 100, [['Grill tool set', 55, 11, ''], ['Coffee sampler', 30, null, '']]],
+    ['Maya (9)', 60, [['Art kit', 38, 2, ''], ['Graphic novel', 15, null, 'Bookshop']]],
+    ['Leo (6)', 60, [['Building set', 45, null, 'Wait for a sale']]],
+    ['Grandma Rose', 50, [['Plant and pot', 30, null, '']]],
+    ['Work Secret Santa', 25, [['Candle', 22, 17, '']]],
+    ['Teachers', 40, [['Gift cards', 40, null, '2 x $20']]]];
+  for (const [name, budget, ideas] of people) {
+    const p = { id: 'gp_' + name.slice(0, 4).toLowerCase().replace(/\W/g, ''), name, budget, gifts: [] };
+    s.gifts.people.push(p);
+    ideas.forEach(([idea, price, ago, where], i) => {
+      const g = { id: p.id + i, idea, price, where, tx: null }; p.gifts.push(g);
+      if (ago !== null) buyGift(p, g, price, addDays(T, -ago), 'joint');
+    });
+  }
   return s;
 }
 
@@ -714,6 +780,7 @@ const IC = {
   goal: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5"/>',
   nw: '<path d="M3 20h18"/><path d="M5 16l4-5 4 3 6-8"/>',
   year: '<path d="M4 20V10M10 20V4M16 20v-8M22 20H2"/>',
+  gift: '<rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13M5 12v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-8"/><path d="M12 8C10.5 4.5 7 4 7 6.2 7 8 10 8 12 8zM12 8c1.5-3.5 5-4 5-1.8C17 8 14 8 12 8z"/>',
   gear: '<circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
   help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 3.5 2.3c-.7.3-1 .9-1 1.7"/><circle cx="12" cy="17" r=".6"/>',
   eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
@@ -724,7 +791,7 @@ const MARK = `<svg class="mk" viewBox="0 0 48 48" aria-hidden="true"><rect width
 
 const ROUTES = {
   home: ['Home', 'home'], spending: ['Spending', 'list'], bills: ['Bills', 'bills'], budget: ['Budget', 'budget'], paychecks: ['Paychecks', 'pay'],
-  debt: ['Debt payoff', 'debt'], goals: ['Savings goals', 'goal'], networth: ['Net worth', 'nw'], year: ['Year view', 'year'], settings: ['Settings', 'gear'], help: ['Help', 'help']
+  debt: ['Debt payoff', 'debt'], goals: ['Savings goals', 'goal'], gifts: ['Gift list', 'gift'], networth: ['Net worth', 'nw'], year: ['Year view', 'year'], settings: ['Settings', 'gear'], help: ['Help', 'help']
 };
 const MONTH_ROUTES = ['home', 'spending', 'bills', 'budget', 'paychecks'];
 
@@ -750,7 +817,7 @@ function render() {
   window.scrollTo(0, y);
 }
 function sideNav() {
-  const items = ['home', 'spending', 'bills', 'budget', 'paychecks', 'debt', 'goals', 'networth', 'year', 'settings', 'help'];
+  const items = ['home', 'spending', 'bills', 'budget', 'paychecks', 'debt', 'goals', 'gifts', 'networth', 'year', 'settings', 'help'];
   return `<div class="brand">${MARK}<div><b>Inkling Budget</b><small>BY INKLING &amp; ION</small></div></div>
   <div style="padding:0 6px 10px"><button class="btn wide" data-a="addTx">${svg('plus', 'style="width:20px;height:20px"')} Add spending</button></div>
   <nav class="sidenav" aria-label="Sections">${items.map(r => `<button data-a="go" data-r="${r}" class="${UI.route === r ? 'on' : ''}">${svg(ROUTES[r][1])}${ROUTES[r][0]}</button>`).join('')}</nav>`;
@@ -779,7 +846,7 @@ function header() {
 function view() {
   switch (UI.route) {
     case 'spending': return vSpending(); case 'bills': return vBills(); case 'budget': return vBudget(); case 'paychecks': return vPaychecks();
-    case 'debt': return vDebt(); case 'goals': return vGoals(); case 'networth': return vNetWorth(); case 'year': return vYear();
+    case 'debt': return vDebt(); case 'goals': return vGoals(); case 'gifts': return vGifts(); case 'networth': return vNetWorth(); case 'year': return vYear();
     case 'settings': return vSettings(); case 'help': return vHelp(); default: return vHome();
   }
 }
@@ -884,7 +951,15 @@ function vHome() {
       <div class="muted small">Based on who paid for shared costs (split: ${splitLabel()}).</div>
       ${Math.abs(b) >= 0.01 ? `<button class="btn sm alt" style="margin-top:10px" data-a="settle">Record a settle-up</button>` : ''}</section>`;
   }
-  return banners() + hero + ci + `<div class="grid2">${billsCard}${groupsCard}${overCard}${goalsCard}${debtCard}${coupleCard}</div>
+  let giftsCard = '';
+  const GT = giftTotals();
+  if (S.gifts.people.length && (GT.days === null || GT.days >= 0)) {
+    giftsCard = `<section class="card"><h2>${esc(S.gifts.title || 'Gift list')}<span class="sp"></span><button class="link" data-a="go" data-r="gifts">Open</button></h2>
+      <div class="between small" style="margin-bottom:6px"><span class="muted">${GT.bought} of ${plural(GT.count, 'gift')} bought${GT.days !== null ? ` · ${GT.days === 0 ? 'today' : plural(GT.days, 'day') + ' to go'}` : ''}</span>
+      <span><b>${money(GT.spent, true)}</b> <span class="muted">of ${money(GT.budget, true)}</span></span></div>
+      <div class="bar ${GT.budget && GT.spent > GT.budget ? 'bad' : GT.budget && GT.proj > GT.budget ? 'warn' : ''}"><i style="width:${GT.budget ? Math.min(100, GT.spent / GT.budget * 100) : 0}%"></i></div></section>`;
+  }
+  return banners() + hero + ci + `<div class="grid2">${billsCard}${groupsCard}${overCard}${goalsCard}${giftsCard}${debtCard}${coupleCard}</div>
     <p class="tiny muted" style="text-align:center;margin:20px 0">A budgeting tool, not financial, tax or legal advice.</p>`;
 }
 function splitLabel() { const s = S.settings; return s.split === 'income' ? 'by income' : s.split === 'custom' ? `${clamp(num(s.customP1), 0, 100)}/${100 - clamp(num(s.customP1), 0, 100)}` : '50/50'; }
@@ -1042,6 +1117,106 @@ function vGoals() {
     <p class="tiny muted" style="text-align:center">Money you add to a goal is logged as savings in its own category, so it shows on Home as “saved”.</p>`;
 }
 
+/* ---------------------------------------------------------------- gift list */
+function vGifts() {
+  const G = S.gifts, T = giftTotals(), gc = cat(G.cat);
+  const when = G.date ? (T.days > 0 ? `${plural(T.days, 'day')} until ${shortDate(G.date)}` : T.days === 0 ? 'It’s today 🎉' : `${shortDate(G.date)} has passed`) : '';
+  const tools = `<div class="btns" style="margin-bottom:14px"><button class="btn" data-a="addPerson">${svg('plus', 'style="width:20px;height:20px"')} Add a person</button>
+    <button class="btn alt" data-a="giftListEdit">List name &amp; date</button></div>`;
+  if (!G.people.length) return tools + `<section class="card"><div class="empty"><span class="big">🎁</span><b>Plan every gift in one place.</b><br>
+    Add the people you’re buying for, a budget for each, and gift ideas with rough prices.<br>Tick a gift when you buy it and it’s logged as spending, so your budget stays right.</div></section>`;
+  const hero = `<section class="card hero"><div class="ring"></div><div class="lab">${esc(G.title || 'Gift list')}${when ? ' · ' + when : ''}</div>
+    <div class="big ${T.left < 0 ? 'neg' : ''}">${money(T.left)}</div>
+    <div class="sub">${T.budget ? (T.left >= 0 ? 'left in your gift budget' : 'over your gift budget') : 'Give each person a budget to see what’s left'}</div>
+    <div class="tiles"><div class="tile"><div class="t">Budget</div><div class="v">${money(T.budget, true)}</div></div>
+    <div class="tile"><div class="t">Spent</div><div class="v">${money(T.spent, true)}</div></div>
+    <div class="tile"><div class="t">To buy</div><div class="v">${T.toBuy}</div></div></div></section>`;
+  const projOver = T.budget > 0 && T.proj > T.budget;
+  const proj = T.toBuy ? `<section class="card"><div class="between small" style="margin-bottom:6px"><b>If you buy the rest at your estimates</b><b>${money(T.proj)}</b></div>
+    <div class="bar ${projOver ? 'warn' : ''}"><i style="width:${T.budget ? Math.min(100, T.proj / T.budget * 100) : 0}%"></i></div>
+    <div class="tiny ${projOver ? 'warn' : 'muted'}" style="margin-top:6px">${T.budget ? (projOver ? `That’s ${money(T.proj - T.budget)} over your budget. Trim an idea or two, or raise a budget.` : `That’s ${money(T.budget - T.proj)} under your budget.`) : ''}
+    ${T.noIdeas ? ` ${plural(T.noIdeas, 'person')} without a gift idea yet.` : ''}</div></section>` : '';
+  const over = G.date && T.days < 0 ? `<div class="banner info"><div style="font-size:1.6rem">🎄</div><div><div class="ttl">Done for this year?</div>
+    <div class="small">Start next year’s list. It keeps your people and their budgets and clears the gifts. What you spent stays on the Spending screen.</div>
+    <div class="acts"><button class="btn sm" data-a="giftSeason">Start next year’s list</button></div></div></div>` : '';
+  const cards = G.people.map(p => {
+    const pi = personInfo(p), st = pi.budget > 0 && pi.spent > pi.budget ? 'bad' : pi.budget > 0 && pi.proj > pi.budget ? 'warn' : 'good';
+    const note = pi.budget > 0 && pi.spent > pi.budget ? `<span class="bad">${money(pi.spent - pi.budget)} over</span>`
+      : pi.toBuy ? `${pi.budget ? money(pi.left) + ' left · ' : ''}${pi.toBuy} to buy${pi.est ? `, about ${money(pi.est)}` : ''}`
+      : pi.count ? `All bought ✓${pi.budget ? ' · ' + money(pi.left) + ' left' : ''}` : 'No gift ideas yet';
+    return `<section class="card"><h2>${esc(p.name)}<span class="sp"></span><span class="small" style="font-family:var(--sans)">${money(pi.spent, true)} <span class="muted">/ ${money(pi.budget, true)}</span></span>
+      <button class="link" data-a="editPerson" data-id="${p.id}" aria-label="Edit ${esc(p.name)}">Edit</button></h2>
+      <div class="bar ${st}"><i style="width:${pi.budget > 0 ? Math.min(100, pi.spent / pi.budget * 100) : 0}%"></i></div>
+      <div class="tiny muted" style="margin-top:4px">${note}</div>
+      ${p.gifts.length ? `<ul class="list" style="margin-top:4px">${p.gifts.map(g => giftRow(p, g)).join('')}</ul>` : ''}
+      <button class="btn sm ghost" style="margin-top:8px" data-a="addGift" data-p="${p.id}">${svg('plus', 'style="width:16px;height:16px"')} Add a gift idea</button></section>`;
+  }).join('');
+  return over + hero + proj + tools + `<div class="grid2">${cards}</div>
+    <p class="tiny muted" style="text-align:center;margin-top:18px">Tick a gift when you buy it and it’s logged as spending in ${esc(gc ? gc.name : 'Gifts')}, so Home and your budget stay right. Untick it to remove the entry.</p>
+    ${G.date && T.days >= 0 ? '<div style="text-align:center"><button class="btn sm ghost" data-a="giftSeason">Start a new list</button></div>' : ''}`;
+}
+function giftRow(p, g) {
+  const t = giftTx(g), on = !!t;
+  const meta = (on ? `Bought ${shortDate(t.date)}` : num(g.price) ? `About ${money(g.price)}` : 'No price yet') + (g.where ? ` · ${esc(g.where)}` : '');
+  return `<li class="li"><button class="check ${on ? 'on' : ''}" data-a="${on ? 'unbuyGift' : 'buyGift'}" data-p="${p.id}" data-g="${g.id}" aria-label="${on ? 'Mark ' + esc(g.idea) + ' not bought' : 'Mark ' + esc(g.idea) + ' bought'}">✓</button>
+    <div class="grow tap" data-a="editGift" data-p="${p.id}" data-g="${g.id}" style="cursor:pointer;min-width:0"><div class="name">${esc(g.idea)}</div><div class="meta">${meta}</div></div>
+    ${on ? `<div class="val">${money(t.amt)}</div>` : ''}</li>`;
+}
+const findPerson = id => S.gifts.people.find(p => p.id === id);
+function personSheet(p) {
+  const edit = !!p;
+  openSheet(`${sheetHead(edit ? 'Edit person' : 'Add a person')}
+    <label class="f"><span>Name</span><input class="in" id="f_name" value="${esc(p?.name || '')}" placeholder="Mom, Leo, teachers, Secret Santa…" maxlength="32" autofocus></label>
+    <label class="f"><span>Budget for this person</span><input class="in" inputmode="decimal" id="f_amt" value="${p ? num(p.budget) || '' : ''}" placeholder="0"><small>The most you want to spend on them in total.</small></label>
+    ${edit ? `<p class="tiny muted">Deleting removes ${esc(p.name)} and their gift ideas. Anything already bought stays on the Spending screen.</p>` : ''}
+    <div class="btns"><button class="btn" data-a="sheetSave">${edit ? 'Save' : 'Add'}</button>${edit ? `<button class="btn danger" data-a="delPerson" data-id="${p.id}">Delete</button>` : ''}</div>`,
+    () => {
+      const name = $('#f_name').value.trim(); if (!name) return toast('Type a name');
+      const rec = { name, budget: parseAmt($('#f_amt').value) };
+      if (edit) Object.assign(p, rec); else S.gifts.people.push({ id: uid(), ...rec, gifts: [] });
+      closeSheet(); commit(); toast(edit ? 'Saved' : `${name} added`);
+    });
+}
+function giftSheet(p, g, buyNow) {
+  const edit = !!g, t = giftTx(g), bought = !!t || !!buyNow;
+  openSheet(`${sheetHead(edit ? 'Edit gift' : 'Add a gift idea')}<p class="small muted" style="margin-top:0">For <b>${esc(p.name)}</b></p>
+    <label class="f"><span>Gift idea</span><input class="in" id="f_name" value="${esc(g?.idea || '')}" placeholder="Book, scarf, gift card…" maxlength="40" ${buyNow ? '' : 'autofocus'}></label>
+    <div class="f2"><label class="f"><span>Rough price</span><input class="in" inputmode="decimal" id="f_price" value="${g ? num(g.price) || '' : ''}" placeholder="0"></label>
+    <label class="f"><span>Where / note (optional)</span><input class="in" id="f_where" value="${esc(g?.where || '')}" placeholder="Store, size, link…" maxlength="40"></label></div>
+    <div class="toggle"><div><b>Bought it</b><div class="tiny muted">Logs the amount paid as spending in ${esc(cat(S.gifts.cat)?.name || 'Gifts')}</div></div>
+    <button type="button" class="sw ${bought ? 'on' : ''}" id="f_bought" data-a="sw" data-show="f_buybox" aria-pressed="${bought}" aria-label="Bought it"></button></div>
+    <div id="f_buybox" style="display:${bought ? 'block' : 'none'};margin-top:10px"><div class="f2"><label class="f"><span>Amount paid</span><input class="in" inputmode="decimal" id="f_paid" value="${t ? t.amt : g && num(g.price) ? num(g.price) : ''}" placeholder="0" ${buyNow ? 'autofocus' : ''}></label>
+    <label class="f"><span>Date</span><input class="in" type="date" id="f_bdate" value="${t?.date || todayISO()}"></label></div>
+    ${whoSeg(t?.who || 'joint')}</div>
+    <div class="btns" style="margin-top:14px"><button class="btn" data-a="sheetSave">${edit ? 'Save' : 'Add'}</button>${edit ? `<button class="btn danger" data-a="delGift" data-p="${p.id}" data-g="${g.id}">Delete</button>` : ''}</div>`,
+    () => {
+      const idea = $('#f_name').value.trim(); if (!idea) return toast('Type the gift idea');
+      const rec = { idea, price: parseAmt($('#f_price').value), where: $('#f_where').value.trim() };
+      const wantBought = $('#f_bought').classList.contains('on'), paid = parseAmt($('#f_paid').value);
+      if (wantBought && paid <= 0) return toast('Type the amount you paid');
+      let gg = g;
+      if (edit) Object.assign(g, rec); else { gg = { id: uid(), ...rec, tx: null }; p.gifts.push(gg); }
+      const cur = giftTx(gg), date = $('#f_bdate').value || todayISO(), who = isCouple() ? segVal('who') || 'joint' : 'joint';
+      if (wantBought && !cur) buyGift(p, gg, paid, date, who);
+      else if (wantBought && cur) Object.assign(cur, { amt: paid, date, who, note: `${idea} for ${p.name}`.slice(0, 60) });
+      else if (!wantBought && cur) unbuyGift(gg);
+      closeSheet(); commit(); toast(wantBought && !cur ? `Bought · ${fmtMoney(paid)} logged as spending` : 'Saved');
+    });
+}
+function giftListSheet() {
+  const G = S.gifts;
+  openSheet(`${sheetHead('Gift list')}
+    <label class="f"><span>List name</span><input class="in" id="f_name" value="${esc(G.title || '')}" placeholder="Holiday gifts, Birthdays 2027…" maxlength="32"></label>
+    <label class="f"><span>Date (optional)</span><input class="in" type="date" id="f_date" value="${esc(G.date || '')}"><small>Shows a countdown. Clear it for a list with no deadline.</small></label>
+    <label class="f"><span>Log bought gifts in</span><select class="in" id="f_cat">${catOptions(G.cat && cat(G.cat) ? G.cat : S.cats.find(c => /gift/i.test(c.name) && c.group !== 'Income')?.id, ['Wants', 'Needs', 'Savings'])}</select><small>Gifts already bought stay where they are.</small></label>
+    <div class="btns"><button class="btn" data-a="sheetSave">Save</button></div>`,
+    () => {
+      G.title = $('#f_name').value.trim() || 'Gift list'; G.date = $('#f_date').value || '';
+      if ($('#f_cat').value) G.cat = $('#f_cat').value;
+      closeSheet(); commit(); toast('Saved');
+    });
+}
+
 /* ---------------------------------------------------------------- net worth */
 function vNetWorth() {
   const nw = netWorth(), hist = Object.entries(S.nw.hist).sort();
@@ -1135,6 +1310,7 @@ function vHelp() {
     ['How is “left to spend” worked out?', 'Money you logged this month, plus paychecks still to come (from your Paychecks schedule), minus what you spent and saved, minus bills that are still due this month. Tap “How is this worked out?” on Home to see the numbers. Log your paycheck when it lands. The check-in reminds you on payday.'],
     ['Do I have to log bills twice?', 'No. Tick a bill on the Bills screen and it’s logged as spending for you. Untick it and the entry is removed. Autopay bills tick themselves on the due date.'],
     ['I paid a bill a different amount this month.', 'Tick it, then open the entry on the Spending screen and change the amount.'],
+    ['How does the gift list work?', 'More › Gift list. Add the people you’re buying for, a budget for each, and gift ideas with rough prices. Tick a gift when you buy it and it’s logged as spending (in your Gifts category), so Home and your budget stay right. Untick it to remove the entry. When the holiday is over, “Start next year’s list” keeps your people and budgets and clears the gifts. Rename the list for birthdays or anything else.'],
     ['How do I start a new year?', 'Nothing to reset. Your categories, bills and goals carry on, and the Year view shows each year separately.'],
     ['Is this financial advice?', 'No. It’s a tool for organizing your own numbers. Debt and savings figures are estimates.']
   ];
@@ -1288,6 +1464,7 @@ function txSheet() {
     <div class="f2"><label class="f"><span>Date</span><input class="in" type="date" id="f_date" value="${esc(d.date)}"></label>
     <label class="f"><span>Note</span><input class="in" id="f_note" value="${esc(d.note)}" placeholder="Where / what" maxlength="60"></label></div>
     ${t?.bill ? '<p class="tiny muted">This entry came from ticking a bill. Deleting it marks the bill unpaid again.</p>' : ''}
+    ${t?.gift ? '<p class="tiny muted">This entry came from the gift list. Deleting it marks the gift not bought.</p>' : ''}
     <div class="btns"><button class="btn" data-a="sheetSave">${edit ? 'Save' : 'Add'}</button>${edit ? `<button class="btn danger" data-a="delTx" data-id="${t.id}">Delete</button>` : ''}</div>`,
     () => {
       const dd = readTxDraft(), amt = parseAmt(dd.amt);
@@ -1545,7 +1722,7 @@ function toast(msg, undo) {
 /* ---------------------------------------------------------------- actions */
 const ACT = {
   go: el => { UI.route = el.dataset.r; closeSheet(true); render(); window.scrollTo(0, 0); },
-  more: () => openSheet(`${sheetHead('More')}<ul class="list">${['budget', 'paychecks', 'debt', 'goals', 'networth', 'year', 'settings', 'help'].map(r => `<li class="li tap" data-a="go" data-r="${r}"><div class="ico" style="color:var(--acc)">${svg(ROUTES[r][1], 'style="width:22px;height:22px"')}</div><div class="grow name">${ROUTES[r][0]}</div><span class="muted">›</span></li>`).join('')}</ul>`),
+  more: () => openSheet(`${sheetHead('More')}<ul class="list">${['budget', 'paychecks', 'debt', 'goals', 'gifts', 'networth', 'year', 'settings', 'help'].map(r => `<li class="li tap" data-a="go" data-r="${r}"><div class="ico" style="color:var(--acc)">${svg(ROUTES[r][1], 'style="width:22px;height:22px"')}</div><div class="grow name">${ROUTES[r][0]}</div><span class="muted">›</span></li>`).join('')}</ul>`),
   month: el => { UI.M = addMonthsKey(UI.M, Number(el.dataset.d)); render(); },
   thisMonth: () => { UI.M = monthOf(todayISO()); render(); },
   year: el => { UI.Y += Number(el.dataset.d); render(); },
@@ -1579,6 +1756,7 @@ const ACT = {
     for (const b of S.bills) if (b.cat === id) b.cat = to || S.cats.find(c => c.id !== id && c.group === 'Bills')?.id;
     for (const p of S.pays) if (p.cat === id) p.cat = to || S.cats.find(c => c.id !== id && c.group === 'Income')?.id;
     for (const d of S.debts) if (d.cat === id) d.cat = null;
+    if (S.gifts.cat === id) S.gifts.cat = to || null;
     S.cats = S.cats.filter(c => c.id !== id); closeSheet(); commit(); undoable('Category deleted', snap);
   },
   addPay: () => paySheet(null),
@@ -1595,6 +1773,23 @@ const ACT = {
   delGoal: el => { const snap = snapshot(), g = S.goals.find(x => x.id === el.dataset.id); S.goals = S.goals.filter(x => x !== g);
     if (g && !S.tx.some(t => t.cat === g.cat)) S.cats = S.cats.filter(c => c.id !== g.cat);
     closeSheet(); commit(); undoable('Goal deleted (its savings entries are kept)', snap); },
+  addPerson: () => personSheet(null),
+  editPerson: el => personSheet(findPerson(el.dataset.id)),
+  delPerson: el => { const snap = snapshot(), p = findPerson(el.dataset.id); S.gifts.people = S.gifts.people.filter(x => x !== p); closeSheet(); commit(); undoable(`${p ? p.name : 'Person'} removed (spending kept)`, snap); },
+  addGift: el => giftSheet(findPerson(el.dataset.p), null),
+  editGift: el => { const p = findPerson(el.dataset.p); giftSheet(p, p?.gifts.find(g => g.id === el.dataset.g)); },
+  delGift: el => { const snap = snapshot(), p = findPerson(el.dataset.p); if (p) p.gifts = p.gifts.filter(g => g.id !== el.dataset.g); closeSheet(); commit(); undoable('Gift idea deleted (spending kept)', snap); },
+  buyGift: el => {
+    const p = findPerson(el.dataset.p), g = p?.gifts.find(x => x.id === el.dataset.g); if (!g) return;
+    if (num(g.price) <= 0) return giftSheet(p, g, true);
+    const snap = snapshot(); buyGift(p, g, num(g.price), todayISO(), 'joint'); commit(); askPersist();
+    undoable(`Bought · ${fmtMoney(num(g.price))} logged`, snap);
+  },
+  unbuyGift: el => { const p = findPerson(el.dataset.p), g = p?.gifts.find(x => x.id === el.dataset.g); if (!g) return; const snap = snapshot(); unbuyGift(g); commit(); undoable(`${g.idea} marked not bought`, snap); },
+  giftListEdit: () => giftListSheet(),
+  giftSeason: () => openSheet(`${sheetHead('Start a new list?')}<p>Keeps your people and their budgets and clears every gift idea. What you already spent stays on the Spending screen.${S.gifts.date ? ' The date moves on a year if it has passed.' : ''}</p>
+    <div class="btns"><button class="btn" data-a="sheetSave">Start new list</button><button class="btn alt" data-a="closeSheet">Cancel</button></div>`,
+    () => { const snap = snapshot(); newGiftSeason(); closeSheet(); commit(); undoable('New gift list started', snap); }),
   addAcct: el => acctSheet(null, el.dataset.k),
   editAcct: el => acctSheet(S.nw.accts.find(a => a.id === el.dataset.id)),
   delAcct: el => { const snap = snapshot(); S.nw.accts = S.nw.accts.filter(a => a.id !== el.dataset.id); closeSheet(); commit(); undoable('Deleted', snap); },
